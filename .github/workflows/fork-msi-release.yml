@@ -1,0 +1,221 @@
+#
+# Fork-only workflow: builds the x64 MSI installer and publishes it as a
+# GitHub release in THIS fork.
+#
+# This file intentionally lives next to (not inside) Build_mR-NB.yml so that
+# syncing the fork with upstream never produces a merge conflict here.
+#
+# The installer is x64-only by design: Installer.wixproj hardcodes
+# HarvestPath to mRemoteNG\bin\x64\$(Configuration) and Config.wxi only
+# defines the platform variables for x64.
+#
+name: Fork - Build MSI and Release
+
+on:
+  push:
+    branches:
+      - v1.78.2-dev
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: fork-msi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-msi:
+    name: Build x64 MSI
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+
+    steps:
+      - name: (01) Checkout repository
+        uses: actions/checkout@v7
+
+      - name: (02) Install .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: (03) Set up MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+
+      - name: (04) Transform T4 templates
+        shell: pwsh
+        run: |
+          dotnet tool install --global dotnet-t4
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          $ttFile = "$env:GITHUB_WORKSPACE\mRemoteNG\Properties\AssemblyInfo.tt"
+          $interopDll = "$env:GITHUB_WORKSPACE\mRemoteNG\libs\Microsoft.VisualStudio.Interop.dll"
+          if (!(Test-Path $interopDll)) {
+            throw "Microsoft.VisualStudio.Interop.dll was not found at $interopDll"
+          }
+          t4 $ttFile -P platformType=x64 -r:"$interopDll"
+
+      - name: (05) Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-x64-msi-nuget-${{ hashFiles('**/*.csproj', '**/*.wixproj') }}
+          restore-keys: |
+            ${{ runner.os }}-x64-msi-nuget-
+            ${{ runner.os }}-x64-nuget-
+
+      - name: (06) Restore mRemoteNG
+        shell: pwsh
+        run: |
+          dotnet restore "$env:GITHUB_WORKSPACE\mRemoteNG\mRemoteNG.csproj" -p:Configuration=Release -p:Platform=x64
+
+      # The application must be built with the full .NET Framework MSBuild from
+      # Visual Studio: mRemoteNG.csproj uses COM references, and the .NET Core
+      # version of MSBuild fails on them with MSB4803 (ResolveComReference).
+      #
+      # The SDK environment variables are scoped to this step on purpose. If
+      # MSBuildSDKsPath leaks into the WiX build below, the WiX extension
+      # packages are no longer handed to the linker and the build dies with
+      # WIX0094 ("the identifier 'WixUI:WixUI_Common' could not be found").
+      - name: (07) Build mRemoteNG (Release, x64)
+        shell: pwsh
+        run: |
+          $msbuild = (Get-Command msbuild -ErrorAction Stop).Source
+          $dotnetPath = (Get-Command dotnet -ErrorAction Stop).Source
+          $dotnetRoot = Split-Path $dotnetPath -Parent
+
+          $sdkBasePathLine = & dotnet --info |
+            Select-String -Pattern '^\s*Base Path:\s*(.+)$' |
+            Select-Object -First 1
+          if ($null -eq $sdkBasePathLine) {
+            throw "Unable to determine active .NET SDK base path from 'dotnet --info'"
+          }
+          $sdkBasePath = $sdkBasePathLine.Matches[0].Groups[1].Value.Trim()
+          $msbuildSdksPath = Join-Path $sdkBasePath "Sdks"
+          if (!(Test-Path $msbuildSdksPath)) {
+            throw "MSBuild SDKs path was not found at $msbuildSdksPath"
+          }
+
+          $env:MSBuildSDKsPath = $msbuildSdksPath
+          $env:DOTNET_MSBUILD_SDK_RESOLVER_CLI_DIR = $dotnetRoot
+          $env:DOTNET_ROOT = $dotnetRoot
+
+          & $msbuild "$env:GITHUB_WORKSPACE\mRemoteNG\mRemoteNG.csproj" `
+            -p:Configuration=Release `
+            -p:Platform=x64 `
+            -p:MSBuildEnableWorkloadResolver=false `
+            -v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "mRemoteNG build failed with exit code $LASTEXITCODE" }
+
+      - name: (08) Verify application output
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\mRemoteNG\bin\x64\Release\mRemoteNG.exe"
+          if (!(Test-Path $exe)) {
+            throw "Expected mRemoteNG.exe at $exe"
+          }
+          Write-Host "Built $exe" -ForegroundColor Green
+
+      # Built with 'dotnet build', NOT with the Visual Studio MSBuild: only the
+      # .NET SDK restore wires the WixToolset.*.wixext PackageReferences up as
+      # linker extensions. A Visual Studio MSBuild '-t:Restore,Build' of this
+      # project fails with WIX0094.
+      - name: (09) Build MSI installer (Release, x64)
+        shell: pwsh
+        run: |
+          dotnet build "$env:GITHUB_WORKSPACE\mRemoteNGInstaller\Installer\Installer.wixproj" `
+            -c Release `
+            -p:Platform=x64 `
+            -v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed with exit code $LASTEXITCODE" }
+
+      - name: (10) Collect release information
+        id: info
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\mRemoteNG\bin\x64\Release\mRemoteNG.exe"
+          $fileVersion = (Get-Item $exe).VersionInfo.FileVersion
+          if ($fileVersion -match '^(?<ver>\d+\.\d+\.\d+)\.(?<build>\d+)$') {
+            $version = $Matches['ver']
+            $build = $Matches['build']
+          } else {
+            throw "Unexpected file version '$fileVersion' on $exe"
+          }
+
+          $srcMsi = "$env:GITHUB_WORKSPACE\mRemoteNGInstaller\Installer\bin\x64\Release\en-US\mRemoteNG-Installer.msi"
+          if (!(Test-Path $srcMsi)) {
+            throw "Expected MSI at $srcMsi"
+          }
+
+          $msiName = "mRemoteNG-Installer-$fileVersion-NB-x64.msi"
+          Copy-Item $srcMsi -Destination "$env:GITHUB_WORKSPACE\$msiName" -Force
+
+          $sizeMb = [math]::Round((Get-Item "$env:GITHUB_WORKSPACE\$msiName").Length / 1MB, 2)
+          Write-Host "MSI: $msiName ($sizeMb MB)" -ForegroundColor Green
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "build=$build" >> $env:GITHUB_OUTPUT
+          echo "fileversion=$fileVersion" >> $env:GITHUB_OUTPUT
+          echo "msiname=$msiName" >> $env:GITHUB_OUTPUT
+          echo "tag=msi-v$version-NB$build" >> $env:GITHUB_OUTPUT
+
+      - name: (11) Extract changelog section
+        id: changelog
+        shell: pwsh
+        run: |
+          $lines = Get-Content "$env:GITHUB_WORKSPACE\CHANGELOG.md"
+
+          $startIndex = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## \[') { $startIndex = $i; break }
+          }
+          if ($startIndex -eq -1) { throw "No version header found in CHANGELOG.md" }
+
+          $section = @()
+          for ($i = $startIndex + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { break }
+            $section += $lines[$i]
+          }
+
+          $joined = $section -join "`n"
+          echo "log<<MSI_CHANGELOG_EOF" >> $env:GITHUB_OUTPUT
+          echo $joined >> $env:GITHUB_OUTPUT
+          echo "MSI_CHANGELOG_EOF" >> $env:GITHUB_OUTPUT
+
+      - name: (12) Upload MSI as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mRemoteNG-MSI-x64
+          path: ${{ steps.info.outputs.msiname }}
+          retention-days: 14
+
+      - name: (13) Publish release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.info.outputs.tag }}
+          name: "mRemoteNG ${{ steps.info.outputs.version }} NB ${{ steps.info.outputs.build }} - MSI (x64)"
+          files: ${{ steps.info.outputs.msiname }}
+          draft: false
+          prerelease: true
+          body: |
+            ## mRemoteNG ${{ steps.info.outputs.version }} Nightly Build ${{ steps.info.outputs.build }}
+
+            Unofficial fork build. Install with the MSI below.
+
+            | | |
+            |---|---|
+            | Installer | `${{ steps.info.outputs.msiname }}` |
+            | Version | ${{ steps.info.outputs.fileversion }} |
+            | Architecture | x64 |
+            | Deployment | Framework-dependent - requires the **.NET 10 Desktop Runtime** |
+            | Commit | ${{ github.sha }} |
+
+            > The MSI is not code-signed, so Windows SmartScreen may warn on first run.
+
+            ---
+
+            ### Changes
+            ${{ steps.changelog.outputs.log }}
