@@ -45,6 +45,14 @@
     <Reference Include="System.Management" />
   </ItemGroup>
 
+  <!-- MakeSfxCA packages only items of type Content. The SDK globs classify
+       CustomAction.config as None, so without this entry it is missing from
+       CustomActions.CA.dll and SfxCA aborts with "Failed to get requested CLR
+       info" (0x80131700) before any custom action runs. -->
+  <ItemGroup>
+    <Content Include="CustomAction.config" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="WixToolset.Dtf.CustomAction" />
     <PackageReference Include="WixToolset.Dtf.WindowsInstaller" />
