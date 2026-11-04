@@ -9,7 +9,8 @@
     <OutputType>Package</OutputType>
     <Cultures>en-US</Cultures>
     <SuppressPdbOutput>true</SuppressPdbOutput>
-    <DefineConstants>InstallerSolutionDir=$(MSBuildProjectDirectory)\..\..\;HarvestPath=$(MSBuildProjectDirectory)\..\..\mRemoteNG\bin\x64\$(Configuration)</DefineConstants>
+    <AppBuildOutputPath>$(MSBuildProjectDirectory)\..\..\mRemoteNG\bin\x64\$(Configuration)</AppBuildOutputPath>
+    <DefineConstants>InstallerSolutionDir=$(MSBuildProjectDirectory)\..\..\;HarvestPath=$(AppBuildOutputPath)</DefineConstants>
     <OutputPath>bin\$(Platform)\$(Configuration)\</OutputPath>
     <IntermediateOutputPath>obj\$(Platform)\$(Configuration)\</IntermediateOutputPath>
   </PropertyGroup>
@@ -31,6 +32,22 @@
     <Content Include="Resources\Installer_Header.png" />
     <Content Include="Resources\Installer_Side.png" />
   </ItemGroup>
+
+  <!-- The MandatoryComponents group, which mRemoteNG.wxs references, is generated
+       from the build output. It used to be a hand-maintained list and had gone
+       stale: it shipped 99 of 213 files, omitting mRemoteNG.deps.json and all of
+       Assemblies\, so the installed application could not start. -->
+  <Target Name="GenerateInstallerFileList" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <GeneratedFileListPath>$(IntermediateOutputPath)HarvestedFiles.wxs</GeneratedFileListPath>
+    </PropertyGroup>
+
+    <Exec Command='powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(MSBuildProjectDirectory)\..\..\Tools\generate_installer_filelist.ps1" -HarvestPath "$(AppBuildOutputPath)" -OutputFile "$(GeneratedFileListPath)"' />
+
+    <ItemGroup>
+      <Compile Include="$(GeneratedFileListPath)" />
+    </ItemGroup>
+  </Target>
 
   <Target Name="RunInstallerPostBuild" AfterTargets="Build" Condition="'$(APPVEYOR_BUILD_FOLDER)' != ''">
     <Exec Command='powershell.exe -ExecutionPolicy Bypass -File "$(InstallerSolutionDir)Tools\postbuild_installer.ps1" -SolutionDir "$(InstallerSolutionDir)\\" -TargetDir "$(TargetDir)" -TargetFileName "mRemoteNG.exe" -ConfigurationName "$(Configuration)" -CertificatePath "$(CertPath)" -CertificatePassword "$(CertPassword)" -ExcludeFromSigning "PuTTYNG.exe"' />
