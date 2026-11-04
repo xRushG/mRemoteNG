@@ -47,6 +47,14 @@ namespace mRemoteNG.App
         /// </summary>
         public static bool UseCredentialManager => false;
 
+        /// <summary>
+        /// Feature flag to enable the user profile store. The flow in
+        /// <see cref="TryInitializeUserProfile"/> is unfinished: it asks for a
+        /// profile password on every start, before it knows whether a profile
+        /// database exists at all, so it stays off until that is sorted out.
+        /// </summary>
+        public static bool UseUserProfiles => false;
+
         public static WindowList WindowList { get; set; } = null!; // initialized during FrmMain startup
         public static MessageCollector MessageCollector { get; } = new MessageCollector();
         public static NotificationAreaIcon NotificationAreaIcon { get; set; } = null!; // initialized on demand by settings/UI
