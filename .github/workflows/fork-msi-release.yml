@@ -154,11 +154,18 @@ jobs:
           $sizeMb = [math]::Round((Get-Item "$env:GITHUB_WORKSPACE\$msiName").Length / 1MB, 2)
           Write-Host "MSI: $msiName ($sizeMb MB)" -ForegroundColor Green
 
+          # AssemblyInfo.tt derives the build number from the number of days
+          # since 2019-09-02, so it only changes once a day. Without the commit
+          # in the tag, every push on the same day targets the release that an
+          # earlier push already created.
+          $shortSha = "$env:GITHUB_SHA".Substring(0, 7)
+
           echo "version=$version" >> $env:GITHUB_OUTPUT
           echo "build=$build" >> $env:GITHUB_OUTPUT
           echo "fileversion=$fileVersion" >> $env:GITHUB_OUTPUT
           echo "msiname=$msiName" >> $env:GITHUB_OUTPUT
-          echo "tag=msi-v$version-NB$build" >> $env:GITHUB_OUTPUT
+          echo "shortsha=$shortSha" >> $env:GITHUB_OUTPUT
+          echo "tag=msi-v$version-NB$build-$shortSha" >> $env:GITHUB_OUTPUT
 
       - name: (11) Extract changelog section
         id: changelog
@@ -196,7 +203,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.info.outputs.tag }}
-          name: "mRemoteNG ${{ steps.info.outputs.version }} NB ${{ steps.info.outputs.build }} - MSI (x64)"
+          name: "mRemoteNG ${{ steps.info.outputs.version }} NB ${{ steps.info.outputs.build }} (${{ steps.info.outputs.shortsha }}) - MSI (x64)"
           files: ${{ steps.info.outputs.msiname }}
           draft: false
           prerelease: true
@@ -219,3 +226,30 @@ jobs:
 
             ### Changes
             ${{ steps.changelog.outputs.log }}
+
+      # Every commit now gets its own release, so without pruning each push would
+      # leave a prerelease behind for good. Failing here must not fail a build
+      # whose MSI was published successfully, hence continue-on-error.
+      - name: (14) Prune old MSI prereleases
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $keep = 5
+
+          $json = gh release list --repo "$env:GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt,isPrerelease
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list releases (exit code $LASTEXITCODE)" }
+
+          $releases = @($json | ConvertFrom-Json |
+            Where-Object { $_.isPrerelease -and $_.tagName -like 'msi-v*' } |
+            Sort-Object { [datetime]$_.createdAt } -Descending)
+
+          Write-Host "Found $($releases.Count) MSI prerelease(s), keeping the newest $keep."
+          if ($releases.Count -le $keep) { exit 0 }
+
+          foreach ($release in $releases | Select-Object -Skip $keep) {
+            Write-Host "Deleting $($release.tagName)"
+            gh release delete $release.tagName --repo "$env:GITHUB_REPOSITORY" --cleanup-tag --yes
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete $($release.tagName)" }
+          }
